@@ -1,4 +1,4 @@
-# go-preloader-http
+# go-preloader-http (WIP)
 
 Preload API data for websites on the first fetch — a lightweight alternative to full server-side rendering (SSR).
 
