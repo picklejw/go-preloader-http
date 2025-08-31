@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 func isDev() bool {
@@ -50,39 +52,44 @@ func (iw *InterceptWriter) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-type HttpPreloaderContext struct {
-	routes map[string]map[string]PreloadRouteMap // method -> path -> route
+type HttpPreloaderContext[T any] struct {
+	routes               map[string]map[string]PreloadRouteMap
+	UserData             T
+	staggaredTestingMode bool
+	reactIndexTextParts  []string // the sandwich where we mush the preload data into
 }
 
-func (ctx *HttpPreloaderContext) Get(pattern string, handler http.HandlerFunc) {
+func (ctx *HttpPreloaderContext[T]) Get(pattern string, handler http.HandlerFunc) {
 	ctx.addRoute(http.MethodGet, pattern, handler)
 }
-func (ctx *HttpPreloaderContext) Post(pattern string, handler http.HandlerFunc) {
+func (ctx *HttpPreloaderContext[T]) Post(pattern string, handler http.HandlerFunc) {
 	ctx.addRoute(http.MethodPost, pattern, handler)
 }
-func (ctx *HttpPreloaderContext) Put(pattern string, handler http.HandlerFunc) {
+func (ctx *HttpPreloaderContext[T]) Put(pattern string, handler http.HandlerFunc) {
 	ctx.addRoute(http.MethodPut, pattern, handler)
 }
-func (ctx *HttpPreloaderContext) Patch(pattern string, handler http.HandlerFunc) {
+func (ctx *HttpPreloaderContext[T]) Patch(pattern string, handler http.HandlerFunc) {
 	ctx.addRoute(http.MethodPatch, pattern, handler)
 }
-func (ctx *HttpPreloaderContext) Delete(pattern string, handler http.HandlerFunc) {
+func (ctx *HttpPreloaderContext[T]) Delete(pattern string, handler http.HandlerFunc) {
 	ctx.addRoute(http.MethodDelete, pattern, handler)
 }
-func (ctx *HttpPreloaderContext) Handle(method, pattern string, handler http.HandlerFunc) {
+func (ctx *HttpPreloaderContext[T]) Handle(method, pattern string, handler http.HandlerFunc) {
 	ctx.addRoute(method, pattern, handler)
 }
 
-func (ctx *HttpPreloaderContext) addRoute(method, pattern string, handler http.HandlerFunc) {
+func (ctx *HttpPreloaderContext[T]) addRoute(method, pattern string, handler http.HandlerFunc) {
 	if ctx.routes[method] == nil {
 		ctx.routes[method] = make(map[string]PreloadRouteMap)
 	}
 	ctx.routes[method][pattern] = PreloadRouteMap{Path: pattern, Handler: handler}
 }
 
-func NewHttpPreloaderContext() *HttpPreloaderContext {
-	return &HttpPreloaderContext{
-		routes: make(map[string]map[string]PreloadRouteMap),
+func NewHttpPreloaderContext[T any](userData T, staggaredTestingMode bool) *HttpPreloaderContext[T] {
+	return &HttpPreloaderContext[T]{
+		routes:               make(map[string]map[string]PreloadRouteMap),
+		UserData:             userData,
+		staggaredTestingMode: staggaredTestingMode,
 	}
 }
 
@@ -100,50 +107,68 @@ func requestIsDefaultIndex(path string) bool {
 	return false
 }
 
-func (ctx *HttpPreloaderContext) HttpPreloader(
+func (ctx *HttpPreloaderContext[T]) HttpPreloader(
 	next http.Handler,
 	apiPrefix string,
 	reactAppBuildRoot string,
 ) http.Handler {
+	// Build react parts here
+
+	useProxy := false
+	if reactAppBuildRoot == "" {
+		useProxy = true
+	} else {
+		if stat, err := os.Stat(reactAppBuildRoot); err != nil || !stat.IsDir() {
+			useProxy = true
+		}
+	}
+
+	var reactIndexText, errMsg string
+	if useProxy {
+		// fetch index.html from proxy
+		target := "http://localhost:3000/index.html"
+		resp, err := http.Get(target)
+		if err != nil {
+			errMsg = "failed to fetch index.html from proxy"
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		reactIndexText = string(body)
+	} else {
+		// fetch index.html from disk
+		reqPath := filepath.Join(reactAppBuildRoot, "index.html")
+		body, err := os.ReadFile(reqPath)
+		if err != nil {
+			errMsg = "failed to read index.html from disk"
+		}
+		reactIndexText = string(body)
+	}
+
+	if idx := strings.LastIndex(strings.ToLower(reactIndexText), "</body>"); idx != -1 {
+		ctx.reactIndexTextParts = []string{
+			reactIndexText[:idx], // everything before </body>
+			reactIndexText[idx:], // </body> and after
+		}
+	} else {
+		ctx.reactIndexTextParts = []string{
+			reactIndexText,
+			"",
+		}
+	}
+
+	if errMsg != "" {
+		log.Fatal("Critical error:", errMsg)
+		return nil
+	}
+
+	println("React Index Cached, will need to restart if index.html is updated.")
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		uri := r.URL.Path
 
 		if !strings.HasPrefix(uri, apiPrefix) { // this is a request for a page from React, not a /api request
-			// Are we in dev mode or static build?
-			useProxy := false
-			if reactAppBuildRoot == "" {
-				useProxy = true
-			} else {
-				if stat, err := os.Stat(reactAppBuildRoot); err != nil || !stat.IsDir() {
-					useProxy = true
-				}
-			}
 
-			reactIndexText := ""
-
-			if requestIsDefaultIndex(r.URL.Path) {
-				if useProxy {
-					// fetch index.html from proxy
-					target := "http://localhost:3000/index.html"
-					resp, err := http.Get(target)
-					if err != nil {
-						http.Error(w, "failed to fetch index.html from proxy", http.StatusBadGateway)
-						return
-					}
-					defer resp.Body.Close()
-					body, _ := io.ReadAll(resp.Body)
-					reactIndexText = string(body)
-				} else {
-					// fetch index.html from disk
-					reqPath := filepath.Join(reactAppBuildRoot, "index.html")
-					body, err := os.ReadFile(reqPath)
-					if err != nil {
-						http.Error(w, "failed to read index.html from disk", http.StatusInternalServerError)
-						return
-					}
-					reactIndexText = string(body)
-				}
-			} else { // some other resource, like a file
+			if !requestIsDefaultIndex(r.URL.Path) {
 				if useProxy {
 					target := "http://localhost:3000"
 					url, _ := url.Parse(target)
@@ -160,66 +185,80 @@ func (ctx *HttpPreloaderContext) HttpPreloader(
 				return
 			}
 
-			// we need to break down the path, so this code is called for "/" and "/item?id=shit"
-			// this once this is built then
-
 			// Build the preloader handler requests:
-			parts := strings.SplitN(r.RequestURI, "?", 2)
-			basePath := parts[0]
-			pathSegments := strings.Split(basePath, "/")
+			if !ctx.staggaredTestingMode {
+				parts := strings.SplitN(r.RequestURI, "?", 2)
+				basePath := parts[0]
+				pathSegments := strings.Split(basePath, "/")
 
-			preloadRequests := map[string]*InterceptWriter{}
-			currentPathReq := ""
+				preloadRequests := map[string]*InterceptWriter{}
+				var wg sync.WaitGroup
+				mu := &sync.Mutex{}
+				currentPathReq := ""
 
-			for i, segment := range pathSegments {
-				if len(currentPathReq) > 0 && currentPathReq[len(currentPathReq)-1] == '/' {
-					currentPathReq = currentPathReq + segment
-				} else {
-					currentPathReq = currentPathReq + "/" + segment
-				}
-				if route, ok := ctx.routes[r.Method][currentPathReq]; ok {
-					preloadWriter := NewInterceptWriter()
-					if i == len(pathSegments)-1 {
-						route.Handler(preloadWriter, r)
+				for i, segment := range pathSegments {
+					if len(currentPathReq) > 0 && currentPathReq[len(currentPathReq)-1] == '/' {
+						currentPathReq = currentPathReq + segment
 					} else {
-						// Hacking to remove query parameters when not full path request handled:
-						rCopy := r.Clone(r.Context())
-						urlCopy := *rCopy.URL
-						urlCopy.RawQuery = ""
-						rCopy.URL = &urlCopy
-						route.Handler(preloadWriter, rCopy)
+						currentPathReq = currentPathReq + "/" + segment
 					}
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						if route, ok := ctx.routes[r.Method][currentPathReq]; ok {
+							preloadWriter := NewInterceptWriter()
+							if i == len(pathSegments)-1 {
+								route.Handler(preloadWriter, r)
+							} else {
+								// Hacking to remove query parameters when not full path request handled:
+								rCopy := r.Clone(r.Context())
+								urlCopy := *rCopy.URL
+								urlCopy.RawQuery = ""
+								rCopy.URL = &urlCopy
+								route.Handler(preloadWriter, rCopy)
+							}
 
-					if i == len(pathSegments)-1 {
-						currentPathReq = r.RequestURI // no need to get fancy, its just the base request
-					}
+							if i == len(pathSegments)-1 {
+								currentPathReq = r.RequestURI // no need to get fancy, it's just the base request
+							}
 
-					preloadRequests[currentPathReq] = preloadWriter
+							mu.Lock()
+							preloadRequests[currentPathReq] = preloadWriter
+							mu.Unlock()
+						}
+					}()
 				}
-			}
 
-			// Done handoing all data requests, now bundle it in .html request:
+				wg.Wait()
 
-			responseJSON, _ := json.Marshal(preloadRequests)
-			varString := "<script>window.httpPreload=" + string(responseJSON) + "</script>"
+				// Done handoing all data requests, now bundle it in .html request:
 
-			if idx := strings.LastIndex(strings.ToLower(reactIndexText), "</body>"); idx != -1 {
-				reactIndexText = reactIndexText[:idx] + varString + reactIndexText[idx:]
-			} else {
-				reactIndexText += varString
-			}
+				//ctx.reactIndexTextParts
+				responseJSON, _ := json.Marshal(preloadRequests)
+				varString := "<script>window.httpPreload=" + string(responseJSON) + "</script>"
 
-			if iw, ok := preloadRequests[r.RequestURI]; ok && iw != nil {
-				if iw.StatusCode != 404 {
-					for k, vv := range iw.Headers {
-						for _, v := range vv {
-							w.Header().Add(k, v)
+				// if idx := strings.LastIndex(strings.ToLower(reactIndexText), "</body>"); idx != -1 {
+				// 	reactIndexText = reactIndexText[:idx] + varString + reactIndexText[idx:]
+				// } else {
+				// 	reactIndexText += varString
+				// }
+
+				requestedReactIndexText := ctx.reactIndexTextParts[0] + varString + ctx.reactIndexTextParts[1]
+
+				if iw, ok := preloadRequests[r.RequestURI]; ok && iw != nil {
+					if iw.StatusCode != 404 {
+						for k, vv := range iw.Headers {
+							for _, v := range vv {
+								w.Header().Add(k, v)
+							}
 						}
 					}
 				}
+				w.Write([]byte(requestedReactIndexText))
+				return
 			}
 
-			w.Write([]byte(reactIndexText))
+			w.Write([]byte(ctx.reactIndexTextParts[0] + ctx.reactIndexTextParts[1]))
 		} else {
 			// this is a API request, need to handler by prepending`apiPrefix`
 			println(r.URL.Path)
